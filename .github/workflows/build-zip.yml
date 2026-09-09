@@ -59,10 +59,6 @@ jobs:
 
           [ -f "ecosystem.config.js" ] && cp ecosystem.config.js release/lx-music-sync-server/
           [ -f "config.js" ] && cp config.js release/lx-music-sync-server/
-          [ -f "changelog.md" ] && cp changelog.md release/lx-music-sync-server/
-          [ -f "LICENSE" ] && cp LICENSE release/lx-music-sync-server/
-          [ -f "README.md" ] && cp README.md release/lx-music-sync-server/
-
       # 仅编译产物的 zip（不含 node_modules，体积小，用户需自行 npm install）
       - name: Create source-only zip archive
         run: |
