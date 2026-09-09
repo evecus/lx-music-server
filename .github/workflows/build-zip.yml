@@ -1,0 +1,153 @@
+name: Build Server Zip (Multi-Arch)
+on:
+  workflow_dispatch:
+    inputs:
+      upload_release:
+        description: '是否发布为 GitHub Release（否则仅生成 Artifact 供下载）'
+        type: boolean
+        default: true
+
+jobs:
+  # ============ 1. 编译 TypeScript（只需一次，与架构无关） ============
+  compile:
+    name: Compile TypeScript
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
+      tag: ${{ steps.tag.outputs.tag }}
+
+    steps:
+      - name: 获取当前时间作为 Tag
+        id: tag
+        run: echo "tag=$(date -u +'%Y%m%d-%H%M%S')" >> $GITHUB_OUTPUT
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '16'
+          cache: 'npm'
+
+      # 读取版本号（来自 public/js/config.js 中的 version 字段）
+      - name: Read version from config
+        id: get_version
+        run: |
+          VERSION=$(grep "version:" public/js/config.js | sed "s/.*'\(.*\)'.*/\1/")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Detected version: $VERSION"
+
+      # 生成构建哈希，写入 public/js/config.js（用于前端"关于/版本"展示）
+      - name: Generate build hash
+        run: node scripts/update-build-hash.js
+
+      - name: Install dependencies
+        run: npm ci
+
+      # 实际编译步骤：tsc 把 src/*.ts 编译到 server/*.js，再用 tsc-alias 替换路径别名
+      - name: Build project (tsc)
+        run: npm run build
+
+      # 组装"运行所需的源文件"目录：编译产物 + 前端资源 + 启动脚本 + package.json
+      # 注意：这里不含 node_modules，留给下面的矩阵 job 各自安装
+      - name: Assemble release directory (no node_modules)
+        run: |
+          mkdir -p release/lx-music-sync-server
+
+          cp -r server public scripts index.js package.json package-lock.json release/lx-music-sync-server/
+
+          [ -f "ecosystem.config.js" ] && cp ecosystem.config.js release/lx-music-sync-server/
+          [ -f "config.js" ] && cp config.js release/lx-music-sync-server/
+          [ -f "changelog.md" ] && cp changelog.md release/lx-music-sync-server/
+          [ -f "LICENSE" ] && cp LICENSE release/lx-music-sync-server/
+          [ -f "README.md" ] && cp README.md release/lx-music-sync-server/
+
+      # 仅编译产物的 zip（不含 node_modules，体积小，用户需自行 npm install）
+      - name: Create source-only zip archive
+        run: |
+          cd release
+          zip -qr lx-music-sync-server-${{ steps.get_version.outputs.version }}.zip lx-music-sync-server
+
+      - name: Upload compiled sources (for matrix jobs)
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiled-sources
+          path: release/lx-music-sync-server
+          retention-days: 1
+
+      - name: Upload source-only zip artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lx-music-sync-server-${{ steps.get_version.outputs.version }}-nodeps
+          path: release/lx-music-sync-server-${{ steps.get_version.outputs.version }}.zip
+          retention-days: 30
+
+      - name: 创建 GitHub Release 并上传文件
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: test
+          name: LX Music Sync Server test
+          files: release/lx-music-sync-server-${{ steps.get_version.outputs.version }}.zip
+          draft: false
+          prerelease: false
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ============ 2. 双架构安装依赖并打包 ============
+  build:
+    name: Install deps & Package (${{ matrix.arch }})
+    needs: compile
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm  # GitHub 原生 ARM64 runner
+
+    steps:
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '16'
+
+      - name: 下载编译产物
+        uses: actions/download-artifact@v4
+        with:
+          name: compiled-sources
+          path: lx-music-sync-server
+
+      - name: 执行 npm install（生成当前架构的 node_modules）
+        run: |
+          cd lx-music-sync-server
+          echo "⚙️ 正在为 ${{ matrix.arch }} 安装生产依赖..."
+          npm install --production --no-audit --no-fund
+          echo "✅ npm install 完成"
+          echo "📁 安装后目录结构 (前3层):"
+          find . -maxdepth 3 -not -path '*/node_modules/*' | head -50
+
+      - name: 打包完整文件夹（含 node_modules）
+        run: |
+          VERSION="${{ needs.compile.outputs.version }}"
+          ARCH="${{ matrix.arch }}"
+          OUTPUT_NAME="lx-music-sync-server-${VERSION}-${ARCH}.tar.gz"
+
+          echo "📦 正在打包: lx-music-sync-server -> $OUTPUT_NAME"
+          tar -czf "$OUTPUT_NAME" lx-music-sync-server
+          echo "ARTIFACT_NAME=$OUTPUT_NAME" >> $GITHUB_ENV
+          echo "✅ 打包完成: $OUTPUT_NAME ($(du -sh "$OUTPUT_NAME" | cut -f1))"
+
+      - name: 创建 GitHub Release 并上传文件
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: test
+          name: LX Music Sync Server test
+          files: ${{ env.ARTIFACT_NAME }}
+          draft: false
+          prerelease: false
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
